@@ -1,0 +1,345 @@
+---
+title: "Random Forest"
+format: html
+---
+
+# Datos
+
+* size_mm	tamano tumoral en mm al inicio del tratamiento
+* State	a la fecha de corte de seguimiento, si la paciente fallecio o sigue con vida
+* TNM	sistema para clasificar estadificar el tumor (https://www.cancer.gov/espanol/cancer/diagnostico-estadificacion/estadificacion)
+* T_stage	tamano y extension del tumor primario
+* N_stage	ganglios linfaticos comprometidos con cancer
+* Histological_Grade	grado de diferenciacion del tumor (I:bajo, II: intermedio, III: alto)
+* Time	momento en que la muestra fue tomada (baseline=antes del tto, followup=despues de la cirugia) - todos son baseline
+* Batch	las muestras fueron secuenciadas en 2 lotes diferentes, ya se hubieron prueba y no hubo efecto de lote - no se tiene en cuenta
+* HERlow	una clasificacion actual de algunos subtipos,
+* RA	numero de la historia clinica (no es importante para este estudio)
+* Clinical_Stage	Estadio clinico de la paciente al iniciar el tratamiento
+* Treatment_ungrouped	tipo de regimen quimioterapeutico recibido
+* Treatment	agrupacion de regimenes en grupos similares (AC: antraciclinas, T: Taxanos, H: Trastuzumab, C: Carboplatinos)
+* AMR	fraccion de ancestria nativo-americana
+* AFR	fraccion de ancestria africana
+* EUR	fraccion de ancestria europea
+
+```{r}
+rm(list =ls())
+
+library(readxl)
+library(dplyr)
+library(data.table)
+
+nac_rawcounts <- read.delim("MichelleGuevaraNieto_BL_rawcounts_withX.txt")
+colnames(nac_rawcounts)[1] <- "Gene"
+nac_metadata <- read.delim("MichelleGuevaraNieto_AllSamples_sample_attributes_withX_ancestry.txt")
+nac_metadata$Response <- trimws(nac_metadata$Response)
+nac_metadata <- nac_metadata %>% arrange(SampleName)
+DEGs <- read_excel("DEGs.xlsx")
+
+# length(unique(DEGs$Gene))
+# table(nac_metadata$Subtype)
+
+conteos_DEGs <- nac_rawcounts %>% 
+  filter(Gene %in% DEGs$Gene) %>% 
+  select(all_of("Gene"), sort(setdiff(names(.), "Gene")))
+
+# Valida que los genes esten en el mismo orden en ambas tablas
+nac_metadata$SampleName == colnames(conteos_DEGs)[2:59]
+
+datos <- as.matrix(conteos_DEGs[, 2:59])
+
+# Normalización vst
+library(DESeq2)
+datos_normalizados <- varianceStabilizingTransformation(datos)
+```
+
+```{r}
+# Calcula el promedio por subtipo
+promedios_subtipo <- sapply(unique(nac_metadata$Subtype), function(st) {
+  rowMeans(datos_normalizados[, nac_metadata$Subtype == st, drop = FALSE])
+})
+
+# 1. sd global (todos los datos juntos en un vector)
+sd_global <- sd(promedios_subtipo, na.rm = TRUE)
+
+promedios_subtipo <- as.data.frame(promedios_subtipo)
+rownames(promedios_subtipo) <- conteos_DEGs$Gene
+
+# 2. sd entre los promedio de cada gen
+sd_gen <- apply(promedios_subtipo, 1, sd, na.rm = TRUE)
+
+sum(sd_gen > sd_global)
+sum(sd_gen > quantile(sd_gen, c(0.9)))
+
+# Conteos modelo
+conteos_modelo <- as.data.frame(datos_normalizados) %>% 
+  mutate(Gene = conteos_DEGs$Gene) %>%
+  filter(sd_gen > quantile(sd_gen, c(0.9))) %>% 
+  transpose(make.names = "Gene", keep.names = "SampleName")
+```
+
+Se escogen los genes con mayor desviacion estandar entre promedios por subtipo, ya que estos son los que permitiran mejor diferenciar por subtipo en la clasificación. No se hace por FC porque fueron construidos independientemete cada subtipo.
+
+```{r}
+variables_clinicas <- nac_metadata %>%
+  select(SampleName,Response,Subtype,TNM,T_stage,N_stage,Histological_Grade,HERlow,Age,Menopause_Status,BMI,Clinical_Stage,Treatment,AMR,AFR,EUR,Indigenous) %>%
+  mutate(across(c(Response,Subtype,TNM,T_stage,N_stage,Histological_Grade,HERlow,Age,Menopause_Status,Clinical_Stage,Treatment,Indigenous), as.factor),
+         across(c(Age,BMI,AMR,AFR,EUR), as.numeric))
+  
+variables <- left_join(variables_clinicas,conteos_modelo, by = "SampleName")
+names(variables) <- gsub("-", "_", names(variables))
+variables <- variables %>% select(-SampleName)
+
+str(variables)
+# colnames(variables)
+```
+
+## Selección de variables
+
+```{r}
+library(randomForest)
+library(caret)
+
+x <- variables[, 3:50]   # Predictores
+y <- variables$Response   # Variable respuesta
+
+# Control del proceso RFE
+control <- rfeControl(
+  functions = rfFuncs,   # Usa random forest
+  method = "cv",         # boot
+  number = 7             # 10-fold CV
+)
+
+# Ejecutar RFE
+set.seed(123)
+resultado_rfe <- rfe(
+  x = x,
+  y = y,
+  sizes = 15:20,          # Prueba modelos con 1, 2, 3 y 4 variables
+  rfeControl = control
+)
+
+# Resultados
+resultado_rfe$optVariables
+resultado_rfe$results 
+plot(resultado_rfe, type = c("g", "o"))
+```
+
+# Random Forest
+
+```{r}
+library(randomForest)
+library(caret)
+
+set.seed(123)
+#trainIndex <- createDataPartition(variables$Response, p = 0.7, list = FALSE)
+#trainData <- variables[trainIndex, ]
+#testData  <- variables[-trainIndex, ]
+
+modelo_rf <- randomForest(
+  as.formula(Response ~ .), 
+  data = variables, 
+  ntree = 1200, # número de árboles
+  mtry = 8, # número de variables aleatorias por split (ajustable) sqrt(p)
+  importance = TRUE # calcular importancia de variables
+)
+
+# Ver el modelo
+print(modelo_rf)
+
+#pred_rf <- predict(modelo_rf, newdata = testData)
+#matriz_conf <- confusionMatrix(pred_rf, testData$Response)
+#print(matriz_conf)
+
+plot(modelo_rf, main = "Error OOB vs. número de árboles")
+
+varImpPlot(modelo_rf, n.var = 20, main = "Top 20 variables importantes")
+
+# Guardar el modelo
+# saveRDS(modelo_rf, "modelo_rf.rds")
+```
+
+```{r}
+# Grafico con ggplot
+imp <- importance(modelo_rf, type = 1) 
+# type 1=mean decrease in accuracy, 2=mean decrease in node impurity
+imp_df <- data.frame(
+  Variable = rownames(imp),
+  Importance = imp[, 1]) %>%
+  arrange(desc(Importance)) %>%
+  head(20)
+
+ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Importancia de variables en Random Forest",
+    x = "Variable",
+    y = "Importancia"
+  )
+```
+
+Importancia 1: Si al romper (desordenar) una variable el error del modelo sube mucho, significa que esa variable era muy importante para predecir. Si el error apenas cambia, esa variable no estaba aportando mucho. Si el error incluso mejora, la variable probablemente era puro ruido.
+
+# XGBoost - Extreme Gradient Boosting
+
+Es como ir corrigiendo paso a paso, cada nuevo árbol mejora los esiduos del anterior.
+
+XGBoost mejora el boosting tradicional con varias optimizaciones:
+
+  * Función objetivo generalizada o de perdida
+  * Construcción de árboles eficiente
+  * En la función de pérdida, penaliza la complejidad de los árboles, esto controla el overfitting.
+  * Shrinkage (learning rate): Cada nuevo árbol contribuye solo una fracción
+  * Subsampling: Muestras aleatorias de filas y columnas en cada iteración (como Random Forest). Ayuda a reducir correlación entre árboles y overfitting.
+
+```{r}
+library(xgboost)
+
+# crea dummies para factores; -1 quita intercepto
+X_all <- model.matrix(Response ~ . - 1, data = variables)
+
+dtrain <- xgb.DMatrix(data = X_all, label = as.integer(variables$Response)-1)
+
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(4, 6, 8),
+  subsample = c(0.7, 0.8, 1),
+  colsample_bytree = c(0.7, 0.8, 1)
+)
+
+set.seed(123)
+nrounds <- 100   # número máximo de árboles
+nfold <- 2       # 5-fold cross-validation
+
+resultados <- list()
+
+for (i in 1:nrow(param_grid)) {
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = param_grid$eta[i],
+    max_depth = param_grid$max_depth[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i]
+  )
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = nrounds,
+    nfold = nfold,
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  resultados[[i]] <- data.frame(
+    eta = param_grid$eta[i],
+    max_depth = param_grid$max_depth[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i],
+    best_iteration = cv$best_iteration,
+    best_auc = cv$evaluation_log$test_auc_mean[cv$best_iteration]
+  )
+}
+
+# Combinar los resultados en un solo data.frame
+resumen <- do.call(rbind, resultados)
+resumen <- resumen %>% arrange(desc(best_auc))
+head(resumen)
+mejores <- resumen[1, ]
+mejores
+
+modelo_xgb <- xgboost(
+  data = dtrain,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = mejores$eta, # learning rate
+  max_depth = mejores$max_depth,
+  subsample = mejores$subsample, # fracción de filas por iteración
+  colsample_bytree = mejores$colsample_bytree, # fracción de columnas por árbol
+  nrounds = mejores$best_iteration,
+  verbose = 1
+)
+
+# Importancia de variables
+importance <- xgb.importance(model = modelo_xgb)
+# xgb.plot.importance(importance, top_n = 30, cex = 0.5)
+
+ggplot(importance, aes(x = reorder(Feature, Frequency), y = Frequency)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Frecuencia de uso en los arboles de variables - XGBoost",
+    x = "Variable",
+    y = "Frecuencia"
+  )
+
+ggplot(importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Contribución predictiva de variables - XGBoost",
+    x = "Variable",
+    y = "Contribución predictiva"
+  )
+
+ggplot(importance, aes(x = reorder(Feature, Cover), y = Cover)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Observaciones relacionadas a las variables - XGBoost",
+    x = "Variable",
+    y = "Observaciones"
+  )
+
+library(DiagrammeR)
+xgb.plot.tree(model = modelo_xgb, trees = 0)  # primer árbol
+```
+
+# UMAP
+
+```{r}
+library(umap)
+library(DESeq2)
+
+num_vars <- variables[,13:ncol(variables)]
+
+#num_norm <- varianceStabilizingTransformation(as.matrix(num_vars))
+#plotPCA(num_norm, intgroup="Response")
+
+set.seed(123)
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 15   # tamaño del vecindario (ajustable)
+umap_config$min_dist <- 0.1     # compactación de clusters
+umap_config$metric <- "euclidean"
+
+umap_res <- umap(num_vars, config = umap_config)
+
+umap_coords <- as.data.frame(umap_res$layout)
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = variables$Response)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(color = "Response")
+```
+
+# PCA
+
+```{r}
+library(ade4)
+library(factoextra)
+pca<-dudi.pca(num_vars,scannf = F, nf = 2)
+fviz_eig(pca)
+s.corcircle(pca$co)
+corrplot::corrplot(cor(num_vars))
+fviz_pca_ind(pca,title="Individuos",habillage = variables$Response)
+fviz_pca_var(pca,title="Variables")
+```
+
+
+
+
